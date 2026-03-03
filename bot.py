@@ -1,4 +1,5 @@
 import calendar
+import json
 import logging
 import os
 from datetime import date, datetime, timedelta
@@ -20,6 +21,7 @@ MAX_POLL_OPTIONS = 10
 POLL_QUESTION = "chasch no?"
 CREATE_POLL_BUTTON = "Umfrog starte"
 NOOP = "x"
+DEFAULT_STATS_PATH = "data/stats.json"
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
 
@@ -88,6 +90,62 @@ def load_token_from_dotenv() -> str:
             return value.strip().strip("\"'")
 
     return ""
+
+
+def resolve_stats_path() -> Path:
+    raw = os.getenv("POLLINATOR_STATS_PATH", DEFAULT_STATS_PATH).strip() or DEFAULT_STATS_PATH
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path
+
+
+def load_stats() -> dict:
+    defaults = {"total_polls": 0, "group_ids": []}
+    stats_path = resolve_stats_path()
+    if not stats_path.exists():
+        return defaults
+
+    try:
+        raw = json.loads(stats_path.read_text(encoding="utf-8"))
+        total = int(raw.get("total_polls", 0))
+        group_ids = [int(chat_id) for chat_id in raw.get("group_ids", [])]
+        return {"total_polls": max(total, 0), "group_ids": sorted(set(group_ids))}
+    except Exception:
+        return defaults
+
+
+def save_stats(stats: dict) -> None:
+    stats_path = resolve_stats_path()
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "total_polls": int(stats.get("total_polls", 0)),
+        "group_ids": [int(chat_id) for chat_id in stats.get("group_ids", [])],
+    }
+    tmp_path = stats_path.with_suffix(stats_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(stats_path)
+
+
+def record_poll_stats(chat) -> None:
+    stats = load_stats()
+    stats["total_polls"] = int(stats.get("total_polls", 0)) + 1
+
+    chat_type = getattr(chat, "type", "")
+    chat_id = getattr(chat, "id", None)
+    if chat_type in ("group", "supergroup") and chat_id is not None:
+        groups = set(int(item) for item in stats.get("group_ids", []))
+        groups.add(int(chat_id))
+        stats["group_ids"] = sorted(groups)
+
+    save_stats(stats)
+
+
+def get_stats_snapshot() -> tuple[int, int]:
+    stats = load_stats()
+    total = int(stats.get("total_polls", 0))
+    groups = len(set(int(item) for item in stats.get("group_ids", [])))
+    return total, groups
 
 
 def clear_poll_state(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -247,6 +305,11 @@ async def send_poll_from_state(
             allows_multiple_answers=True,
         )
         poll_message_ids.add(poll_message.message_id)
+
+    try:
+        record_poll_stats(message.chat)
+    except Exception:
+        logging.exception("Could not write poll stats.")
 
     await cleanup_non_poll_messages(
         context, chat_id=message.chat_id, keep_message_ids=poll_message_ids
@@ -468,6 +531,17 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Da hät nöd klappt. Bitte nomal starte.")
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+
+    total_polls, group_count = get_stats_snapshot()
+    await message.reply_text(
+        f"Bis jetzt gmacht:\n- Polls: {total_polls}\n- Gruppä: {group_count}"
+    )
+
+
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO
@@ -512,6 +586,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("poll", poll_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(picker)
 
     app.run_polling()
