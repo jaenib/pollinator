@@ -95,6 +95,44 @@ def clear_poll_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("poll_end", None)
     context.user_data.pop("view_month_start", None)
     context.user_data.pop("view_month_end", None)
+    context.user_data.pop("cleanup_message_ids", None)
+
+
+def track_for_cleanup(context: ContextTypes.DEFAULT_TYPE, message) -> None:
+    if message is None:
+        return
+    ids = context.user_data.setdefault("cleanup_message_ids", [])
+    if message.message_id not in ids:
+        ids.append(message.message_id)
+
+
+async def cleanup_non_poll_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    keep_message_ids: Optional[set] = None,
+) -> None:
+    keep = keep_message_ids or set()
+    ids = context.user_data.get("cleanup_message_ids", [])
+    for message_id in ids:
+        if message_id in keep:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            # Ignore when bot lacks rights or message is already gone.
+            pass
+
+    context.user_data.pop("cleanup_message_ids", None)
+
+
+def build_question(time_note: Optional[str], part: Optional[str] = None) -> str:
+    base = POLL_QUESTION
+    if time_note:
+        base = f"{POLL_QUESTION} | weli zit? {time_note.strip()}"
+
+    suffix = f" {part}" if part else ""
+    max_base_len = max(1, 300 - len(suffix))
+    return f"{base[:max_base_len].rstrip()}{suffix}"
 
 
 def make_calendar_rows(
@@ -179,6 +217,8 @@ def end_keyboard(view_month: date, start_day: date) -> InlineKeyboardMarkup:
 async def send_poll_from_state(
     message, context: ContextTypes.DEFAULT_TYPE, time_note: Optional[str] = None
 ) -> bool:
+    track_for_cleanup(context, message)
+
     start_iso = context.user_data.get("poll_start")
     end_iso = context.user_data.get("poll_end")
     if not start_iso or not end_iso:
@@ -192,22 +232,25 @@ async def send_poll_from_state(
 
     options = [format_day(start_day + timedelta(days=i)) for i in range(day_count)]
 
-    if time_note:
-        await message.reply_text(f"weli zit? {time_note}")
-
     chunks = [
         options[i : i + MAX_POLL_OPTIONS]
         for i in range(0, len(options), MAX_POLL_OPTIONS)
     ]
     total = len(chunks)
+    poll_message_ids: set[int] = set()
     for idx, chunk in enumerate(chunks, start=1):
-        question = POLL_QUESTION if total == 1 else f"{POLL_QUESTION} ({idx}/{total})"
-        await message.reply_poll(
-            question=question,
+        part = None if total == 1 else f"({idx}/{total})"
+        poll_message = await message.reply_poll(
+            question=build_question(time_note, part=part),
             options=chunk,
             is_anonymous=False,
             allows_multiple_answers=True,
         )
+        poll_message_ids.add(poll_message.message_id)
+
+    await cleanup_non_poll_messages(
+        context, chat_id=message.chat_id, keep_message_ids=poll_message_ids
+    )
     clear_poll_state(context)
     return True
 
@@ -228,14 +271,16 @@ async def begin_poll_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     clear_poll_state(context)
+    track_for_cleanup(context, message)
     today = date.today()
     view_month = date(today.year, today.month, 1)
     context.user_data["view_month_start"] = view_month.isoformat()
 
-    await message.reply_text(
+    picker_message = await message.reply_text(
         "Wähl Starttag:",
         reply_markup=start_keyboard(view_month, today),
     )
+    track_for_cleanup(context, picker_message)
     return PICK_START
 
 
@@ -327,6 +372,7 @@ async def time_option_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     await query.answer()
+    track_for_cleanup(context, query.message)
 
     if query.data == "t:ask":
         await query.edit_message_text("Schrib d Zyt (z.B. 'ab 19:00').")
@@ -337,7 +383,6 @@ async def time_option_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Da hät nöd klappt. Bitte nomal starte.")
         return ConversationHandler.END
 
-    await query.edit_message_text("ganz poll gemacht")
     return ConversationHandler.END
 
 
@@ -346,6 +391,7 @@ async def receive_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if message is None:
         return ConversationHandler.END
 
+    track_for_cleanup(context, message)
     note = (message.text or "").strip()
     if not note:
         await message.reply_text("Bitte gib e chli Angab ii, z.B. 'ab 19:00'.")
@@ -356,7 +402,6 @@ async def receive_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("Da hät nöd klappt. Bitte nomal starte.")
         return ConversationHandler.END
 
-    await message.reply_text("ganz poll gemacht")
     return ConversationHandler.END
 
 
@@ -392,6 +437,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message is None:
         return
 
+    track_for_cleanup(context, update.message)
     if len(context.args) < 2:
         await start_command(update, context)
         return

@@ -54,4 +54,6 @@ Supported day formats:
 Notes:
 - Poll is non-anonymous and allows multiple selections.
 - Lange Datumsbereiche werden automatisch in mehrere Polls aufgeteilt (je max 10 Optionen pro Poll).
-- Optionali Zyt-Notiz wird als extra Nachricht `weli zit? ...` verschickt.
+- Optionali Zyt-Notiz wird i d Poll-Frag integriert (`chasch no? | weli zit? ...`).
+- Nach dr Erstellung löscht dr Bot alli Flow-Nachrichte, so dass nur Poll(s) bliibe.
+- Dafür bruucht dr Bot i de Gruppe Admin-Recht zum Lösche vo Nachrichtä.
