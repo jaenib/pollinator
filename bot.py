@@ -426,6 +426,8 @@ def main() -> None:
     logging.basicConfig(
         format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or load_token_from_dotenv()
     if not token:
