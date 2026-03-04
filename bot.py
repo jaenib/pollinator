@@ -1,3 +1,4 @@
+import asyncio
 import calendar
 import json
 import logging
@@ -6,7 +7,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -20,9 +21,9 @@ from telegram.ext import (
 MAX_POLL_OPTIONS = 10
 POLL_QUESTION = "chasch no?"
 CREATE_POLL_BUTTON = "Umfrog starte"
-START_POLL_CALLBACK = "start_poll"
 NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
+POLL_IDLE_TIMEOUT_SECONDS = 20
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
 
@@ -155,6 +156,7 @@ def clear_poll_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("view_month_start", None)
     context.user_data.pop("view_month_end", None)
     context.user_data.pop("cleanup_message_ids", None)
+    context.user_data.pop("poll_timeout_token", None)
 
 
 def track_for_cleanup(context: ContextTypes.DEFAULT_TYPE, message) -> None:
@@ -182,6 +184,39 @@ async def cleanup_non_poll_messages(
             pass
 
     context.user_data.pop("cleanup_message_ids", None)
+
+
+def arm_poll_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    token = os.urandom(8).hex()
+    context.user_data["poll_timeout_token"] = token
+    asyncio.create_task(poll_timeout_worker(context, chat_id, token))
+
+
+async def poll_timeout_worker(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    token: str,
+) -> None:
+    await asyncio.sleep(POLL_IDLE_TIMEOUT_SECONDS)
+    if context.user_data.get("poll_timeout_token") != token:
+        return
+
+    try:
+        # Clear sticky reply keyboard without leaving a visible message behind.
+        remover = await context.bot.send_message(
+            chat_id=chat_id,
+            text=".",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=remover.message_id)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    await cleanup_non_poll_messages(context, chat_id=chat_id, keep_message_ids=set())
+    clear_poll_state(context)
 
 
 def build_question(time_note: Optional[str], part: Optional[str] = None) -> str:
@@ -320,38 +355,23 @@ async def send_poll_from_state(
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None:
-        return
-
-    await message.reply_text(
-        "Drück uf Umfrog starte.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await message.reply_text(
-        "Umfrog starte:",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton(CREATE_POLL_BUTTON, callback_data=START_POLL_CALLBACK)]]
+    text = "Drück uf Umfrog starte."
+    await update.message.reply_text(
+        text,
+        reply_markup=ReplyKeyboardMarkup(
+            [[CREATE_POLL_BUTTON]], resize_keyboard=True, one_time_keyboard=False
         ),
     )
 
 
 async def begin_poll_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if query is not None:
-        await query.answer()
-        message = query.message
-    else:
-        message = update.effective_message
-
+    message = update.effective_message
     if message is None:
         return ConversationHandler.END
 
     clear_poll_state(context)
     track_for_cleanup(context, message)
-    if query is None and (message.text or "").strip() == CREATE_POLL_BUTTON:
-        remove_message = await message.reply_text("✅", reply_markup=ReplyKeyboardRemove())
-        track_for_cleanup(context, remove_message)
+    arm_poll_timeout(context, message.chat_id)
 
     today = date.today()
     view_month = date(today.year, today.month, 1)
@@ -371,6 +391,8 @@ async def start_picker_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     await query.answer()
+    if query.message is not None:
+        arm_poll_timeout(context, query.message.chat_id)
     data = query.data
     today = date.today()
 
@@ -406,6 +428,8 @@ async def end_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     await query.answer()
+    if query.message is not None:
+        arm_poll_timeout(context, query.message.chat_id)
     data = query.data
     start_iso = context.user_data.get("poll_start")
     if not start_iso:
@@ -454,6 +478,8 @@ async def time_option_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer()
     track_for_cleanup(context, query.message)
+    if query.message is not None:
+        arm_poll_timeout(context, query.message.chat_id)
 
     if query.data == "t:ask":
         await query.edit_message_text("Schrib d Zyt (z.B. 'ab 19:00').")
@@ -473,6 +499,7 @@ async def receive_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     track_for_cleanup(context, message)
+    arm_poll_timeout(context, message.chat_id)
     note = (message.text or "").strip()
     if not note:
         await message.reply_text("Bitte gib e chli Angab ii, z.B. 'ab 19:00'.")
@@ -490,6 +517,8 @@ async def noop_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if query:
         await query.answer()
+        if query.message is not None:
+            arm_poll_timeout(context, query.message.chat_id)
     return PICK_START
 
 
@@ -497,6 +526,8 @@ async def noop_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if query:
         await query.answer()
+        if query.message is not None:
+            arm_poll_timeout(context, query.message.chat_id)
     return PICK_END
 
 
@@ -504,6 +535,8 @@ async def noop_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if query:
         await query.answer()
+        if query.message is not None:
+            arm_poll_timeout(context, query.message.chat_id)
     return PICK_TIME_OPTION
 
 
@@ -579,7 +612,6 @@ def main() -> None:
         entry_points=[
             CommandHandler("newpoll", begin_poll_picker),
             MessageHandler(filters.Regex(r"^Umfrog starte$"), begin_poll_picker),
-            CallbackQueryHandler(begin_poll_picker, pattern=rf"^{START_POLL_CALLBACK}$"),
         ],
         states={
             PICK_START: [
