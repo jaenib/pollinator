@@ -24,6 +24,7 @@ CREATE_POLL_BUTTON = "Umfrog starte"
 NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
 POLL_IDLE_TIMEOUT_SECONDS = 20
+MAX_TRACKED_BOT_MESSAGES_PER_CHAT = 250
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
 
@@ -159,6 +160,87 @@ def clear_poll_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("poll_timeout_token", None)
 
 
+def remember_bot_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
+    if message is None:
+        return
+
+    by_chat = context.application.bot_data.setdefault("recent_bot_messages", {})
+    chat_key = str(message.chat_id)
+    ids = by_chat.setdefault(chat_key, [])
+    if message.message_id not in ids:
+        ids.append(message.message_id)
+    if len(ids) > MAX_TRACKED_BOT_MESSAGES_PER_CHAT:
+        del ids[:-MAX_TRACKED_BOT_MESSAGES_PER_CHAT]
+
+
+def forget_bot_message_id(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
+    by_chat = context.application.bot_data.setdefault("recent_bot_messages", {})
+    chat_key = str(chat_id)
+    ids = by_chat.get(chat_key, [])
+    by_chat[chat_key] = [mid for mid in ids if mid != message_id]
+    if not by_chat[chat_key]:
+        by_chat.pop(chat_key, None)
+
+
+async def reply_text_tracked(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    **kwargs,
+):
+    sent = await message.reply_text(text, **kwargs)
+    remember_bot_message(context, sent)
+    return sent
+
+
+async def reply_poll_tracked(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    **kwargs,
+):
+    sent = await message.reply_poll(**kwargs)
+    remember_bot_message(context, sent)
+    return sent
+
+
+async def send_message_tracked(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    **kwargs,
+):
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    remember_bot_message(context, sent)
+    return sent
+
+
+async def delete_last_bot_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    count: int,
+) -> int:
+    by_chat = context.application.bot_data.setdefault("recent_bot_messages", {})
+    chat_key = str(chat_id)
+    ids = by_chat.get(chat_key, [])
+
+    deleted = 0
+    while ids and deleted < count:
+        message_id = ids.pop()
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            deleted += 1
+        except Exception:
+            # Skip unavailable IDs and keep going.
+            pass
+
+    if ids:
+        by_chat[chat_key] = ids
+    else:
+        by_chat.pop(chat_key, None)
+
+    return deleted
+
+
 def track_for_cleanup(context: ContextTypes.DEFAULT_TYPE, message) -> None:
     if message is None:
         return
@@ -182,6 +264,7 @@ async def cleanup_non_poll_messages(
         except Exception:
             # Ignore when bot lacks rights or message is already gone.
             pass
+        forget_bot_message_id(context, chat_id=chat_id, message_id=message_id)
 
     context.user_data.pop("cleanup_message_ids", None)
 
@@ -203,7 +286,8 @@ async def poll_timeout_worker(
 
     try:
         # Clear sticky reply keyboard without leaving a visible message behind.
-        remover = await context.bot.send_message(
+        remover = await send_message_tracked(
+            context,
             chat_id=chat_id,
             text=".",
             reply_markup=ReplyKeyboardRemove(),
@@ -212,6 +296,7 @@ async def poll_timeout_worker(
             await context.bot.delete_message(chat_id=chat_id, message_id=remover.message_id)
         except Exception:
             pass
+        forget_bot_message_id(context, chat_id=chat_id, message_id=remover.message_id)
     except Exception:
         pass
 
@@ -334,7 +419,9 @@ async def send_poll_from_state(
     poll_message_ids: set[int] = set()
     for idx, chunk in enumerate(chunks, start=1):
         part = None if total == 1 else f"({idx}/{total})"
-        poll_message = await message.reply_poll(
+        poll_message = await reply_poll_tracked(
+            message,
+            context,
             question=build_question(time_note, part=part),
             options=chunk,
             is_anonymous=False,
@@ -356,7 +443,13 @@ async def send_poll_from_state(
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = "Drück uf Umfrog starte."
-    await update.message.reply_text(
+    message = update.message
+    if message is None:
+        return
+
+    await reply_text_tracked(
+        message,
+        context,
         text,
         reply_markup=ReplyKeyboardMarkup(
             [[CREATE_POLL_BUTTON]], resize_keyboard=True, one_time_keyboard=False
@@ -377,7 +470,9 @@ async def begin_poll_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     view_month = date(today.year, today.month, 1)
     context.user_data["view_month_start"] = view_month.isoformat()
 
-    picker_message = await message.reply_text(
+    picker_message = await reply_text_tracked(
+        message,
+        context,
         "Wähl Starttag:",
         reply_markup=start_keyboard(view_month, today),
     )
@@ -502,12 +597,12 @@ async def receive_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     arm_poll_timeout(context, message.chat_id)
     note = (message.text or "").strip()
     if not note:
-        await message.reply_text("Bitte gib e chli Angab ii, z.B. 'ab 19:00'.")
+        await reply_text_tracked(message, context, "Bitte gib e chli Angab ii, z.B. 'ab 19:00'.")
         return WAIT_TIME_TEXT
 
     ok = await send_poll_from_state(message, context, time_note=note)
     if not ok:
-        await message.reply_text("Da hät nöd klappt. Bitte nomal starte.")
+        await reply_text_tracked(message, context, "Da hät nöd klappt. Bitte nomal starte.")
         return ConversationHandler.END
 
     return ConversationHandler.END
@@ -543,7 +638,7 @@ async def noop_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     clear_poll_state(context)
     if update.effective_message:
-        await update.effective_message.reply_text("Abbroche.")
+        await reply_text_tracked(update.effective_message, context, "Abbroche.")
     return ConversationHandler.END
 
 
@@ -562,16 +657,16 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         start_day = parse_day(context.args[0], today)
         end_day = parse_day(context.args[1], today)
     except ValueError:
-        await update.message.reply_text("Datum nöd erkannt. Nimm YYYY-MM-DD, today oder +N.")
+        await reply_text_tracked(update.message, context, "Datum nöd erkannt. Nimm YYYY-MM-DD, today oder +N.")
         return
 
     if end_day < start_day:
-        await update.message.reply_text("Endtag muess gliich oder spöter si.")
+        await reply_text_tracked(update.message, context, "Endtag muess gliich oder spöter si.")
         return
 
     day_count = (end_day - start_day).days + 1
     if day_count < 2:
-        await update.message.reply_text("Bitte mind. 2 Täg wähle.")
+        await reply_text_tracked(update.message, context, "Bitte mind. 2 Täg wähle.")
         return
 
     time_note = " ".join(context.args[2:]).strip()
@@ -579,7 +674,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.user_data["poll_end"] = end_day.isoformat()
     ok = await send_poll_from_state(update.message, context, time_note=time_note or None)
     if not ok:
-        await update.message.reply_text("Da hät nöd klappt. Bitte nomal starte.")
+        await reply_text_tracked(update.message, context, "Da hät nöd klappt. Bitte nomal starte.")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -588,9 +683,24 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     total_polls, group_count = get_stats_snapshot()
-    await message.reply_text(
+    await reply_text_tracked(
+        message,
+        context,
         f"Bis jetzt gmacht:\n- Polls: {total_polls}\n- Gruppä: {group_count}"
     )
+
+
+async def del2_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+
+    try:
+        await context.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
+    except Exception:
+        pass
+
+    await delete_last_bot_messages(context, chat_id=message.chat_id, count=2)
 
 
 def main() -> None:
@@ -638,6 +748,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("poll", poll_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("del2", del2_command))
     app.add_handler(picker)
 
     app.run_polling()
