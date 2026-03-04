@@ -20,7 +20,7 @@ from telegram.ext import (
 
 MAX_POLL_OPTIONS = 10
 POLL_QUESTION = "chasch no?"
-CREATE_POLL_BUTTON = "Umfrog starte"
+CREATE_POLL_BUTTON = "Umfrag starte"
 NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
 POLL_IDLE_TIMEOUT_SECONDS = 20
@@ -415,12 +415,12 @@ async def send_poll_from_state(
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "Drück uf Umfrog starte."
+    text = "Drück uf Umfrag starte."
     message = update.message
     if message is None:
         return
 
-    await reply_text_tracked(
+    sent = await reply_text_tracked(
         message,
         context,
         text,
@@ -428,12 +428,30 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             [[CREATE_POLL_BUTTON]], resize_keyboard=True, one_time_keyboard=False
         ),
     )
+    context.user_data["start_hint_message_id"] = sent.message_id
+    context.user_data["start_hint_chat_id"] = sent.chat_id
 
 
 async def begin_poll_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.effective_message
     if message is None:
         return ConversationHandler.END
+
+    hint_message_id = context.user_data.pop("start_hint_message_id", None)
+    hint_chat_id = context.user_data.pop("start_hint_chat_id", None)
+    if hint_message_id is not None:
+        try:
+            await context.bot.delete_message(
+                chat_id=hint_chat_id or message.chat_id,
+                message_id=hint_message_id,
+            )
+        except Exception:
+            pass
+        forget_bot_message_id(
+            context,
+            chat_id=hint_chat_id or message.chat_id,
+            message_id=hint_message_id,
+        )
 
     clear_poll_state(context)
     track_for_cleanup(context, message)
@@ -501,7 +519,7 @@ async def end_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     data = query.data
     start_iso = context.user_data.get("poll_start")
     if not start_iso:
-        await query.edit_message_text("Starttag fehlt. Bitte nomal uf 'Umfrog starte'.")
+        await query.edit_message_text("Starttag fehlt. Bitte nomal uf 'Umfrag starte'.")
         return ConversationHandler.END
 
     start_day = date.fromisoformat(start_iso)
@@ -700,7 +718,7 @@ def main() -> None:
     picker = ConversationHandler(
         entry_points=[
             CommandHandler("newpoll", begin_poll_picker),
-            MessageHandler(filters.Regex(r"^Umfrog starte$"), begin_poll_picker),
+            MessageHandler(filters.Regex(r"^Umfrag starte$"), begin_poll_picker),
         ],
         states={
             PICK_START: [
