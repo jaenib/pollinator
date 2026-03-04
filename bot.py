@@ -695,12 +695,29 @@ async def del2_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if message is None:
         return
 
+    deleted = 0
+    reply = message.reply_to_message
+    bot_id = getattr(context.bot, "id", None)
+    if (
+        reply is not None
+        and reply.from_user is not None
+        and reply.from_user.id == bot_id
+    ):
+        try:
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=reply.message_id)
+            deleted += 1
+        except Exception:
+            pass
+        forget_bot_message_id(context, chat_id=message.chat_id, message_id=reply.message_id)
+
+    remaining = max(0, 2 - deleted)
+    if remaining > 0:
+        await delete_last_bot_messages(context, chat_id=message.chat_id, count=remaining)
+
     try:
         await context.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
     except Exception:
         pass
-
-    await delete_last_bot_messages(context, chat_id=message.chat_id, count=2)
 
 
 def main() -> None:
