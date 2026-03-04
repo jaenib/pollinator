@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -20,6 +20,7 @@ from telegram.ext import (
 MAX_POLL_OPTIONS = 10
 POLL_QUESTION = "chasch no?"
 CREATE_POLL_BUTTON = "Umfrog starte"
+START_POLL_CALLBACK = "start_poll"
 NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
 
@@ -319,22 +320,39 @@ async def send_poll_from_state(
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "Drück uf Umfrog starte."
-    await update.message.reply_text(
-        text,
-        reply_markup=ReplyKeyboardMarkup(
-            [[CREATE_POLL_BUTTON]], resize_keyboard=True, one_time_keyboard=False
+    message = update.effective_message
+    if message is None:
+        return
+
+    await message.reply_text(
+        "Drück uf Umfrog starte.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await message.reply_text(
+        "Umfrog starte:",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(CREATE_POLL_BUTTON, callback_data=START_POLL_CALLBACK)]]
         ),
     )
 
 
 async def begin_poll_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    message = update.effective_message
+    query = update.callback_query
+    if query is not None:
+        await query.answer()
+        message = query.message
+    else:
+        message = update.effective_message
+
     if message is None:
         return ConversationHandler.END
 
     clear_poll_state(context)
     track_for_cleanup(context, message)
+    if query is None and (message.text or "").strip() == CREATE_POLL_BUTTON:
+        remove_message = await message.reply_text("✅", reply_markup=ReplyKeyboardRemove())
+        track_for_cleanup(context, remove_message)
+
     today = date.today()
     view_month = date(today.year, today.month, 1)
     context.user_data["view_month_start"] = view_month.isoformat()
@@ -561,6 +579,7 @@ def main() -> None:
         entry_points=[
             CommandHandler("newpoll", begin_poll_picker),
             MessageHandler(filters.Regex(r"^Umfrog starte$"), begin_poll_picker),
+            CallbackQueryHandler(begin_poll_picker, pattern=rf"^{START_POLL_CALLBACK}$"),
         ],
         states={
             PICK_START: [
