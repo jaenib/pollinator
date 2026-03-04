@@ -20,18 +20,18 @@ from telegram.ext import (
 
 MAX_POLL_OPTIONS = 10
 POLL_QUESTION = "chasch no?"
-CREATE_POLL_BUTTON = "Umfrag starte"
+CREATE_POLL_BUTTON = "Umfrag machä"
 NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
 POLL_IDLE_TIMEOUT_SECONDS = 20
 MAX_TRACKED_BOT_MESSAGES_PER_CHAT = 250
 INTRO_TEXT = (
-    "Hoi\n\n"
+    "Hoii i machä poll\n\n"
     "1. /start startet mi\n"
-    "2. „Umfrag starte\" startet umfrag\n"
+    "2. „Umfrag machä\"\n"
     "3. /cancel zum abbreche\n"
-    "4. ufene nachricht vo mir mit /wäg antworte löscht die nachricht\n"
-    "5. /hilf zeigt das menu nomal"
+    "4. /wäg uf mini nachricht antworte zum sä lösche\n"
+    "5. /hilf zeigt das menu"
 )
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
@@ -526,7 +526,7 @@ async def end_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     data = query.data
     start_iso = context.user_data.get("poll_start")
     if not start_iso:
-        await query.edit_message_text("Starttag fehlt. Bitte nomal uf 'Umfrag starte'.")
+        await query.edit_message_text("Starttag fehlt. Bitte nomal uf 'Umfrag machä'.")
         return ConversationHandler.END
 
     start_day = date.fromisoformat(start_iso)
@@ -725,7 +725,7 @@ def main() -> None:
     picker = ConversationHandler(
         entry_points=[
             CommandHandler("newpoll", begin_poll_picker),
-            MessageHandler(filters.Regex(r"^Umfrag starte$"), begin_poll_picker),
+            MessageHandler(filters.Regex(r"^Umfrag machä$"), begin_poll_picker),
         ],
         states={
             PICK_START: [
