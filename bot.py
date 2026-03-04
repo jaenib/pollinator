@@ -214,33 +214,6 @@ async def send_message_tracked(
     return sent
 
 
-async def delete_last_bot_messages(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    count: int,
-) -> int:
-    by_chat = context.application.bot_data.setdefault("recent_bot_messages", {})
-    chat_key = str(chat_id)
-    ids = by_chat.get(chat_key, [])
-
-    deleted = 0
-    while ids and deleted < count:
-        message_id = ids.pop()
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            deleted += 1
-        except Exception:
-            # Skip unavailable IDs and keep going.
-            pass
-
-    if ids:
-        by_chat[chat_key] = ids
-    else:
-        by_chat.pop(chat_key, None)
-
-    return deleted
-
-
 def track_for_cleanup(context: ContextTypes.DEFAULT_TYPE, message) -> None:
     if message is None:
         return
@@ -690,29 +663,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def del2_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def del_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
 
-    deleted = 0
     reply = message.reply_to_message
-    bot_id = getattr(context.bot, "id", None)
-    if (
-        reply is not None
-        and reply.from_user is not None
-        and reply.from_user.id == bot_id
-    ):
+    if reply is not None:
         try:
             await context.bot.delete_message(chat_id=message.chat_id, message_id=reply.message_id)
-            deleted += 1
         except Exception:
             pass
         forget_bot_message_id(context, chat_id=message.chat_id, message_id=reply.message_id)
-
-    remaining = max(0, 2 - deleted)
-    if remaining > 0:
-        await delete_last_bot_messages(context, chat_id=message.chat_id, count=remaining)
 
     try:
         await context.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
@@ -765,7 +727,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("poll", poll_command))
     app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("del2", del2_command))
+    app.add_handler(CommandHandler("del", del_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^/(wäg|waeg)(?:@[A-Za-z0-9_]+)?$"), del_command))
     app.add_handler(picker)
 
     app.run_polling()
