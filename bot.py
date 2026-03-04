@@ -25,6 +25,14 @@ NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
 POLL_IDLE_TIMEOUT_SECONDS = 20
 MAX_TRACKED_BOT_MESSAGES_PER_CHAT = 250
+INTRO_TEXT = (
+    "Hoi\n\n"
+    "1. /start startet mi\n"
+    "2. „Umfrag starte\" startet umfrag\n"
+    "3. /cancel zum abbreche\n"
+    "4. ufene nachricht vo mir mit /wäg antworte löscht die nachricht\n"
+    "5. /hilf zeigt das menu nomal"
+)
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
 
@@ -415,7 +423,6 @@ async def send_poll_from_state(
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "Drück uf Umfrag starte."
     message = update.message
     if message is None:
         return
@@ -423,7 +430,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     sent = await reply_text_tracked(
         message,
         context,
-        text,
+        INTRO_TEXT,
         reply_markup=ReplyKeyboardMarkup(
             [[CREATE_POLL_BUTTON]], resize_keyboard=True, one_time_keyboard=False
         ),
@@ -742,6 +749,7 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("hilf", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("poll", poll_command))
     app.add_handler(CommandHandler("stats", stats_command))
