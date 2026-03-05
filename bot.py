@@ -45,12 +45,14 @@ INTRO_TEXT = (
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
 DM_PICK_TARGETS = 10
+DM_WAIT_MANUAL = 11
 
 DM_CB_TOGGLE_PREFIX = "dmt:"
 DM_CB_ALL = "dma"
 DM_CB_NONE = "dmn"
 DM_CB_SEND = "dms"
 DM_CB_CANCEL = "dmc"
+DM_CB_MANUAL = "dmm"
 
 WEEKDAY_HEADER = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 MONTH_NAMES = [
@@ -265,6 +267,7 @@ def clear_dm_pick_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("dm_target_message_id", None)
     context.user_data.pop("dm_targets", None)
     context.user_data.pop("dm_selected_ids", None)
+    context.user_data.pop("dm_manual_handles", None)
 
 
 def dm_targets_as_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, dict]:
@@ -283,9 +286,11 @@ def dm_targets_as_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, dict]:
 def dm_selector_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     target_map = dm_targets_as_map(context)
     selected = set(int(item) for item in (context.user_data.get("dm_selected_ids") or []))
+    manual = context.user_data.get("dm_manual_handles") or []
     return (
         "Wähl, wer i söll pinge.\n"
-        f"{len(selected)} / {len(target_map)} usgwählt."
+        f"{len(selected)} / {len(target_map)} usgwählt.\n"
+        f"Manuell: {len(manual)}"
     )
 
 
@@ -294,12 +299,13 @@ def dm_selector_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMa
     selected = set(int(item) for item in (context.user_data.get("dm_selected_ids") or []))
 
     rows: list[list[InlineKeyboardButton]] = []
-    rows.append(
-        [
-            InlineKeyboardButton("Alli", callback_data=DM_CB_ALL),
-            InlineKeyboardButton("Niemand", callback_data=DM_CB_NONE),
-        ]
-    )
+    if target_map:
+        rows.append(
+            [
+                InlineKeyboardButton("Alli", callback_data=DM_CB_ALL),
+                InlineKeyboardButton("Niemand", callback_data=DM_CB_NONE),
+            ]
+        )
 
     items = sorted(
         target_map.items(),
@@ -316,6 +322,7 @@ def dm_selector_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMa
             [InlineKeyboardButton(f"{prefix}{label[:48]}", callback_data=f"{DM_CB_TOGGLE_PREFIX}{uid}")]
         )
 
+    rows.append([InlineKeyboardButton("Manuell @user", callback_data=DM_CB_MANUAL)])
     rows.append(
         [
             InlineKeyboardButton("Sände", callback_data=DM_CB_SEND),
@@ -332,6 +339,39 @@ def user_ping(meta: dict) -> tuple[str, bool]:
     user_id = int(meta.get("id", 0))
     first_name = html.escape((meta.get("first_name") or "du"))
     return (f'<a href="tg://user?id={user_id}">{first_name}</a>', True)
+
+
+def normalize_poll_text(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def poll_signature(question: str, option_texts: list[str]) -> dict:
+    return {
+        "q": normalize_poll_text(question),
+        "o": [normalize_poll_text(item) for item in option_texts],
+    }
+
+
+def parse_manual_handles(text: str) -> list[str]:
+    if not text:
+        return []
+    out = []
+    for token in text.replace(",", " ").split():
+        if not token.startswith("@"):
+            continue
+        handle = token[1:].strip()
+        if not handle:
+            continue
+        out.append(handle.lstrip("@"))
+    unique = []
+    seen = set()
+    for handle in out:
+        key = handle.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(handle)
+    return unique
 
 
 async def remember_chat_user(
@@ -353,6 +393,8 @@ async def register_poll_reminder(
     poll_id: str,
     initiator: Optional[dict],
     series_id: str,
+    poll_question: str,
+    poll_option_texts: list[str],
 ) -> None:
     lock = get_reminder_lock(application)
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -367,6 +409,7 @@ async def register_poll_reminder(
             "message_id": int(message_id),
             "initiator_id": int(initiator["id"]) if initiator and initiator.get("id") is not None else None,
             "series_id": series_id,
+            "signature": poll_signature(poll_question, poll_option_texts),
             "enabled": True,
             "created_at": now_ts,
             "next_reminder_at": now_ts + REMINDER_INTERVAL_SECONDS,
@@ -513,6 +556,31 @@ async def build_reminder_payload(application: Application, poll_id: str) -> Opti
         }
 
 
+async def resolve_poll_id_from_dm_poll(application: Application, forwarded_poll) -> Optional[str]:
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        polls = state.get("polls", {})
+
+        if forwarded_poll.id in polls:
+            return forwarded_poll.id
+
+        sig = poll_signature(
+            forwarded_poll.question,
+            [opt.text for opt in (forwarded_poll.options or [])],
+        )
+        matches: list[tuple[int, str]] = []
+        for poll_id, poll in polls.items():
+            if poll.get("signature") == sig:
+                created = int(poll.get("created_at", 0) or 0)
+                matches.append((created, poll_id))
+
+        if not matches:
+            return None
+        matches.sort(reverse=True)
+        return matches[0][1]
+
+
 async def send_reminder_for_poll(application: Application, poll_id: str) -> None:
     payload = await build_reminder_payload(application, poll_id)
     if payload is None:
@@ -544,13 +612,27 @@ async def send_manual_reminder(
     chat_id: int,
     message_id: int,
     targets: list[dict],
+    manual_handles: Optional[list[str]] = None,
 ) -> None:
     pings: list[str] = []
+    seen_pings: set[str] = set()
     needs_html = False
     for meta in targets:
         mention, is_html = user_ping(meta)
+        key = mention.lower()
+        if key in seen_pings:
+            continue
+        seen_pings.add(key)
         pings.append(mention)
         needs_html = needs_html or is_html
+
+    for handle in (manual_handles or []):
+        mention = f"@{handle.lstrip('@')}"
+        key = mention.lower()
+        if key in seen_pings:
+            continue
+        seen_pings.add(key)
+        pings.append(mention)
 
     if not pings:
         return
@@ -851,6 +933,8 @@ async def send_poll_from_state(
                 poll_id=poll_message.poll.id,
                 initiator=initiator,
                 series_id=series_id,
+                poll_question=poll_message.poll.question,
+                poll_option_texts=[item.text for item in poll_message.poll.options],
             )
 
     try:
@@ -1206,22 +1290,25 @@ async def dm_forwarded_poll_entry(update: Update, context: ContextTypes.DEFAULT_
     if message is None or message.poll is None:
         return ConversationHandler.END
 
-    payload = await build_reminder_payload(context.application, message.poll.id)
+    resolved_poll_id = await resolve_poll_id_from_dm_poll(context.application, message.poll)
+    if not resolved_poll_id:
+        await reply_text_tracked(message, context, "I kenne die Umfrag nöd oder sie isch uf nöd-stress.")
+        return ConversationHandler.END
+
+    payload = await build_reminder_payload(context.application, resolved_poll_id)
     if payload is None:
         await reply_text_tracked(message, context, "I kenne die Umfrag nöd oder sie isch uf nöd-stress.")
         return ConversationHandler.END
 
     targets = payload.get("targets", [])
-    if not targets:
-        await reply_text_tracked(message, context, "Kei offeni Lüt meh zum pinge.")
-        return ConversationHandler.END
 
     clear_dm_pick_state(context)
-    context.user_data["dm_poll_id"] = message.poll.id
+    context.user_data["dm_poll_id"] = resolved_poll_id
     context.user_data["dm_target_chat_id"] = int(payload["chat_id"])
     context.user_data["dm_target_message_id"] = int(payload["message_id"])
     context.user_data["dm_targets"] = targets
     context.user_data["dm_selected_ids"] = [int(meta["id"]) for meta in targets if meta.get("id") is not None]
+    context.user_data["dm_manual_handles"] = []
 
     await reply_text_tracked(
         message,
@@ -1252,12 +1339,17 @@ async def dm_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text("Abbroche.")
         return ConversationHandler.END
 
+    if data == DM_CB_MANUAL:
+        await query.edit_message_text("Schrib @usernames (z.B. @anna @max).")
+        return DM_WAIT_MANUAL
+
     if data == DM_CB_ALL:
         selected = set(target_map.keys())
     elif data == DM_CB_NONE:
         selected = set()
     elif data == DM_CB_SEND:
-        if not selected:
+        manual = context.user_data.get("dm_manual_handles") or []
+        if not selected and not manual:
             await query.answer("Bitte mind. ei Person uswahlä.", show_alert=True)
             return DM_PICK_TARGETS
 
@@ -1265,7 +1357,13 @@ async def dm_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         message_id = int(context.user_data.get("dm_target_message_id"))
         targets = [meta for uid, meta in target_map.items() if uid in selected]
         try:
-            await send_manual_reminder(context.application, chat_id, message_id, targets)
+            await send_manual_reminder(
+                context.application,
+                chat_id,
+                message_id,
+                targets,
+                manual_handles=manual,
+            )
         except Exception:
             await query.edit_message_text("Sände nöd klappt. Prüef mini Gruppe-Recht.")
             clear_dm_pick_state(context)
@@ -1286,6 +1384,26 @@ async def dm_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     context.user_data["dm_selected_ids"] = sorted(selected)
     await query.edit_message_text(
+        dm_selector_text(context),
+        reply_markup=dm_selector_keyboard(context),
+    )
+    return DM_PICK_TARGETS
+
+
+async def dm_manual_handles_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    message = update.message
+    if message is None:
+        return ConversationHandler.END
+
+    handles = parse_manual_handles(message.text or "")
+    if not handles:
+        await reply_text_tracked(message, context, "Kei @username gfunde. Nochmal versueche.")
+        return DM_WAIT_MANUAL
+
+    context.user_data["dm_manual_handles"] = handles
+    await reply_text_tracked(
+        message,
+        context,
         dm_selector_text(context),
         reply_markup=dm_selector_keyboard(context),
     )
@@ -1371,9 +1489,10 @@ def main() -> None:
             DM_PICK_TARGETS: [
                 CallbackQueryHandler(
                     dm_pick_callback,
-                    pattern=rf"^({DM_CB_TOGGLE_PREFIX}\d+|{DM_CB_ALL}|{DM_CB_NONE}|{DM_CB_SEND}|{DM_CB_CANCEL})$",
+                    pattern=rf"^({DM_CB_TOGGLE_PREFIX}\d+|{DM_CB_ALL}|{DM_CB_NONE}|{DM_CB_SEND}|{DM_CB_CANCEL}|{DM_CB_MANUAL})$",
                 )
             ],
+            DM_WAIT_MANUAL: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, dm_manual_handles_input)],
         },
         fallbacks=[CommandHandler("cancel", dm_cancel_command)],
         allow_reentry=True,
