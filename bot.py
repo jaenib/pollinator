@@ -33,14 +33,14 @@ REMINDER_INTERVAL_SECONDS = 5 * 24 * 60 * 60
 REMINDER_LOOP_SLEEP_SECONDS = 60
 REMINDER_MENTION_CHUNK_SIZE = 8
 INTRO_TEXT = (
-    "Hoii i machä poll\n\n"
-    "1. /start startet mi\n"
-    "2. /umfrag\n"
+    "0. @pollinski_bot in gruppechat\n"
+    "1. /start\n"
+    "2. /umfrag machä\n"
     "3. /cancel zum abbreche\n"
-    "4. /wäg uf mini nachricht antworte zum sä lösche\n"
-    "5. /hilf zeigt das menu\n"
-    "6. /chillmau -> nüm pinge\n"
-    "7. /nostress -> mini Umfrag nüm reminderä"
+    "4. /wäg als antwort uf mini nachricht/umfrag zum lösche\n"
+    "5. /nostress als antwort uf e umfrag = keni reminders für die umfrag\n"
+    "6. /chillmau als antwort ufne reminder = keni reminders für dich\n"
+    "7. /hilf zeigt das menu"
 )
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
@@ -186,7 +186,7 @@ def resolve_reminder_path() -> Path:
 
 
 def load_reminder_state() -> dict:
-    defaults = {"polls": {}, "chats": {}}
+    defaults = {"polls": {}, "chats": {}, "message_links": {}}
     reminder_path = resolve_reminder_path()
     if not reminder_path.exists():
         return defaults
@@ -195,9 +195,10 @@ def load_reminder_state() -> dict:
         raw = json.loads(reminder_path.read_text(encoding="utf-8"))
         polls = raw.get("polls", {})
         chats = raw.get("chats", {})
-        if not isinstance(polls, dict) or not isinstance(chats, dict):
+        message_links = raw.get("message_links", {})
+        if not isinstance(polls, dict) or not isinstance(chats, dict) or not isinstance(message_links, dict):
             return defaults
-        return {"polls": polls, "chats": chats}
+        return {"polls": polls, "chats": chats, "message_links": message_links}
     except Exception:
         return defaults
 
@@ -208,6 +209,7 @@ def save_reminder_state(state: dict) -> None:
     payload = {
         "polls": state.get("polls", {}),
         "chats": state.get("chats", {}),
+        "message_links": state.get("message_links", {}),
     }
     tmp_path = reminder_path.with_suffix(reminder_path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -220,6 +222,10 @@ def get_reminder_lock(application: Application) -> asyncio.Lock:
         lock = asyncio.Lock()
         application.bot_data["reminder_lock"] = lock
     return lock
+
+
+def reminder_message_link_key(chat_id: int, message_id: int) -> str:
+    return f"{int(chat_id)}:{int(message_id)}"
 
 
 def ensure_chat_state(state: dict, chat_id: int) -> dict:
@@ -412,6 +418,7 @@ async def register_poll_reminder(
             "created_at": now_ts,
             "next_reminder_at": now_ts + REMINDER_INTERVAL_SECONDS,
             "voters": [],
+            "muted_user_ids": [],
         }
         chat.setdefault("known_users", {})
         chat.setdefault("chilled_users", [])
@@ -438,58 +445,97 @@ async def update_poll_vote(application: Application, poll_id: str, user, has_vot
         save_reminder_state(state)
 
 
-async def set_user_chilled(application: Application, chat_id: int, user) -> None:
+async def link_reminder_message(
+    application: Application,
+    chat_id: int,
+    message_id: int,
+    poll_id: str,
+) -> None:
     lock = get_reminder_lock(application)
     async with lock:
         state = load_reminder_state()
-        upsert_known_user(state, chat_id, user)
-        chat = ensure_chat_state(state, chat_id)
-        chilled = set(int(item) for item in chat.get("chilled_users", []))
-        chilled.add(int(user.id))
-        chat["chilled_users"] = sorted(chilled)
+        polls = state.setdefault("polls", {})
+        poll = polls.get(poll_id)
+        if poll is None or int(poll.get("chat_id", 0)) != int(chat_id):
+            return
+        links = state.setdefault("message_links", {})
+        links[reminder_message_link_key(chat_id, message_id)] = poll_id
         save_reminder_state(state)
 
 
-async def disable_poll_reminders(
+async def resolve_poll_id_from_reply(
     application: Application,
     chat_id: int,
-    requester_id: int,
-    replied_poll_id: Optional[str],
+    reply_message,
+) -> Optional[str]:
+    if reply_message is None:
+        return None
+
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        polls = state.setdefault("polls", {})
+
+        if reply_message.poll is not None:
+            poll_id = reply_message.poll.id
+            poll = polls.get(poll_id)
+            if poll is not None and int(poll.get("chat_id", 0)) == int(chat_id):
+                return poll_id
+
+        key = reminder_message_link_key(chat_id, int(reply_message.message_id))
+        linked_poll_id = state.get("message_links", {}).get(key)
+        if linked_poll_id is None:
+            return None
+
+        linked_poll_id = str(linked_poll_id)
+        poll = polls.get(linked_poll_id)
+        if poll is None or int(poll.get("chat_id", 0)) != int(chat_id):
+            return None
+        return linked_poll_id
+
+
+async def mute_user_for_poll(
+    application: Application,
+    chat_id: int,
+    poll_id: str,
+    user,
 ) -> tuple[bool, str]:
     lock = get_reminder_lock(application)
     async with lock:
         state = load_reminder_state()
         polls = state.setdefault("polls", {})
-        target = None
+        poll = polls.get(poll_id)
+        if poll is None or int(poll.get("chat_id", 0)) != int(chat_id):
+            return (False, "I finde die Umfrag nöd. Bitte uf en Reminder vo mer antworte.")
 
-        if replied_poll_id:
-            target = polls.get(replied_poll_id)
-            if target is None or int(target.get("chat_id", 0)) != int(chat_id):
-                return (False, "Poll nöd gfunde. Bitte uf de Poll antworte.")
-        else:
-            candidates = [
-                poll
-                for poll in polls.values()
-                if int(poll.get("chat_id", 0)) == int(chat_id)
-                and bool(poll.get("enabled", True))
-                and int(poll.get("initiator_id", 0) or 0) == int(requester_id)
-            ]
-            if not candidates:
-                return (False, "I ha kei aktivi Umfrag vo dir gfunde.")
-            if len(candidates) > 1:
-                return (False, "Bitte uf d Umfrag antworte und /nostress schicke.")
-            target = candidates[0]
+        upsert_known_user(state, chat_id, user)
+        muted = set(int(item) for item in poll.get("muted_user_ids", []))
+        muted.add(int(user.id))
+        poll["muted_user_ids"] = sorted(muted)
+        save_reminder_state(state)
+        return (True, "okok")
 
-        if int(target.get("initiator_id", 0) or 0) != int(requester_id):
-            return (False, "Nur dr Initiant cha /nostress für die Umfrag mache.")
+
+async def disable_poll_reminders(
+    application: Application,
+    chat_id: int,
+    poll_id: str,
+) -> tuple[bool, str]:
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        polls = state.setdefault("polls", {})
+        target = polls.get(poll_id)
+        if target is None or int(target.get("chat_id", 0)) != int(chat_id):
+            return (False, "I finde die Umfrag nöd. Bitte uf en Reminder vo mer antworte.")
 
         series_id = target.get("series_id")
         changed = 0
         for poll in polls.values():
             if int(poll.get("chat_id", 0)) != int(chat_id):
                 continue
-            same_series = series_id and poll.get("series_id") == series_id
-            if same_series or (replied_poll_id and poll is target) or (not series_id and poll is target):
+            same_series = bool(series_id) and poll.get("series_id") == series_id
+            if same_series or poll is target:
                 if bool(poll.get("enabled", True)):
                     poll["enabled"] = False
                     changed += 1
@@ -535,15 +581,15 @@ async def build_reminder_payload(application: Application, poll_id: str) -> Opti
         chat_id = int(poll.get("chat_id", 0))
         chat = ensure_chat_state(state, chat_id)
         known = chat.get("known_users", {})
-        chilled = set(int(item) for item in chat.get("chilled_users", []))
         voters = set(int(item) for item in poll.get("voters", []))
+        muted = set(int(item) for item in poll.get("muted_user_ids", []))
 
         targets = []
         for user_id, meta in known.items():
             uid = int(user_id)
             if meta.get("is_bot"):
                 continue
-            if uid in chilled or uid in voters:
+            if uid in muted or uid in voters:
                 continue
             targets.append(meta)
 
@@ -596,12 +642,18 @@ async def send_reminder_for_poll(application: Application, poll_id: str) -> None
 
     for part in chunked(pings, REMINDER_MENTION_CHUNK_SIZE):
         text = "chasch no? " + " ".join(part)
-        await application.bot.send_message(
+        sent = await application.bot.send_message(
             chat_id=payload["chat_id"],
             text=text,
             reply_to_message_id=payload["message_id"],
             allow_sending_without_reply=True,
             parse_mode="HTML" if needs_html else None,
+        )
+        await link_reminder_message(
+            application,
+            chat_id=int(payload["chat_id"]),
+            message_id=int(sent.message_id),
+            poll_id=poll_id,
         )
 
 
@@ -611,6 +663,7 @@ async def send_manual_reminder(
     message_id: int,
     targets: list[dict],
     manual_handles: Optional[list[str]] = None,
+    poll_id: Optional[str] = None,
 ) -> None:
     pings: list[str] = []
     seen_pings: set[str] = set()
@@ -637,13 +690,20 @@ async def send_manual_reminder(
 
     for part in chunked(pings, REMINDER_MENTION_CHUNK_SIZE):
         text = "chasch no? " + " ".join(part)
-        await application.bot.send_message(
+        sent = await application.bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_to_message_id=message_id,
             allow_sending_without_reply=True,
             parse_mode="HTML" if needs_html else None,
         )
+        if poll_id:
+            await link_reminder_message(
+                application,
+                chat_id=chat_id,
+                message_id=int(sent.message_id),
+                poll_id=poll_id,
+            )
 
 
 async def reminder_loop(application: Application) -> None:
@@ -1235,29 +1295,51 @@ async def chillmau_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if message is None or user is None:
         return
 
-    await set_user_chilled(context.application, message.chat_id, user)
-    await reply_text_tracked(message, context, "okok")
-
-
-async def nostress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    user = update.effective_user
-    if message is None or user is None:
+    if message.reply_to_message is None:
+        await reply_text_tracked(message, context, "Bitte uf en Reminder vo mer antworte.")
         return
 
-    replied_poll_id = None
-    if message.reply_to_message is not None and message.reply_to_message.poll is not None:
-        replied_poll_id = message.reply_to_message.poll.id
+    resolved_poll_id = await resolve_poll_id_from_reply(
+        context.application,
+        chat_id=message.chat_id,
+        reply_message=message.reply_to_message,
+    )
+    if not resolved_poll_id:
+        await reply_text_tracked(message, context, "I finde die Umfrag nöd. Bitte uf en Reminder vo mer antworte.")
+        return
+
+    ok, response = await mute_user_for_poll(
+        context.application,
+        chat_id=message.chat_id,
+        poll_id=resolved_poll_id,
+        user=user,
+    )
+    await reply_text_tracked(message, context, response)
+
+
+async def notress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+
+    if message.reply_to_message is None:
+        await reply_text_tracked(message, context, "Bitte uf en Reminder vo mer antworte.")
+        return
+
+    resolved_poll_id = await resolve_poll_id_from_reply(
+        context.application,
+        chat_id=message.chat_id,
+        reply_message=message.reply_to_message,
+    )
+    if not resolved_poll_id:
+        await reply_text_tracked(message, context, "I finde die Umfrag nöd. Bitte uf en Reminder vo mer antworte.")
+        return
 
     ok, response = await disable_poll_reminders(
         context.application,
         chat_id=message.chat_id,
-        requester_id=user.id,
-        replied_poll_id=replied_poll_id,
+        poll_id=resolved_poll_id,
     )
-    if ok:
-        await reply_text_tracked(message, context, response)
-        return
     await reply_text_tracked(message, context, response)
 
 
@@ -1361,6 +1443,7 @@ async def dm_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 message_id,
                 targets,
                 manual_handles=manual,
+                poll_id=context.user_data.get("dm_poll_id"),
             )
         except Exception:
             await query.edit_message_text("Sände nöd klappt. Prüef mini Gruppe-Recht.")
@@ -1505,7 +1588,8 @@ def main() -> None:
     app.add_handler(CommandHandler("poll", poll_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("chillmau", chillmau_command))
-    app.add_handler(CommandHandler("nostress", nostress_command))
+    app.add_handler(CommandHandler("notress", notress_command))
+    app.add_handler(CommandHandler("nostress", notress_command))
     app.add_handler(CommandHandler("del", del_command))
     app.add_handler(MessageHandler(filters.Regex(r"^/(wäg|waeg)(?:@[A-Za-z0-9_]+)?$"), del_command))
     app.add_handler(dm_picker)
