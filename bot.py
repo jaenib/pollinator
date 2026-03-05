@@ -1,9 +1,11 @@
 import asyncio
 import calendar
+import contextlib
+import html
 import json
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +17,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    PollAnswerHandler,
     filters,
 )
 
@@ -23,15 +26,21 @@ POLL_QUESTION = "chasch no?"
 CREATE_POLL_BUTTON = "Umfrag machä"
 NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
+DEFAULT_REMINDER_PATH = "data/reminders.json"
 POLL_IDLE_TIMEOUT_SECONDS = 20
 MAX_TRACKED_BOT_MESSAGES_PER_CHAT = 250
+REMINDER_INTERVAL_SECONDS = 5 * 24 * 60 * 60
+REMINDER_LOOP_SLEEP_SECONDS = 60
+REMINDER_MENTION_CHUNK_SIZE = 8
 INTRO_TEXT = (
     "Hoii i machä poll\n\n"
     "1. /start startet mi\n"
     "2. „Umfrag machä\"\n"
     "3. /cancel zum abbreche\n"
     "4. /wäg uf mini nachricht antworte zum sä lösche\n"
-    "5. /hilf zeigt das menu"
+    "5. /hilf zeigt das menu\n"
+    "6. /chillmau -> nüm pinge\n"
+    "7. /nostress -> mini Umfrag nüm reminderä"
 )
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
@@ -159,11 +168,334 @@ def get_stats_snapshot() -> tuple[int, int]:
     return total, groups
 
 
+def resolve_reminder_path() -> Path:
+    raw = os.getenv("POLLINATOR_REMINDER_PATH", DEFAULT_REMINDER_PATH).strip() or DEFAULT_REMINDER_PATH
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path
+
+
+def load_reminder_state() -> dict:
+    defaults = {"polls": {}, "chats": {}}
+    reminder_path = resolve_reminder_path()
+    if not reminder_path.exists():
+        return defaults
+
+    try:
+        raw = json.loads(reminder_path.read_text(encoding="utf-8"))
+        polls = raw.get("polls", {})
+        chats = raw.get("chats", {})
+        if not isinstance(polls, dict) or not isinstance(chats, dict):
+            return defaults
+        return {"polls": polls, "chats": chats}
+    except Exception:
+        return defaults
+
+
+def save_reminder_state(state: dict) -> None:
+    reminder_path = resolve_reminder_path()
+    reminder_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "polls": state.get("polls", {}),
+        "chats": state.get("chats", {}),
+    }
+    tmp_path = reminder_path.with_suffix(reminder_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(reminder_path)
+
+
+def get_reminder_lock(application: Application) -> asyncio.Lock:
+    lock = application.bot_data.get("reminder_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        application.bot_data["reminder_lock"] = lock
+    return lock
+
+
+def ensure_chat_state(state: dict, chat_id: int) -> dict:
+    chats = state.setdefault("chats", {})
+    chat_key = str(chat_id)
+    chat = chats.setdefault(chat_key, {})
+    chat.setdefault("known_users", {})
+    chat.setdefault("chilled_users", [])
+    return chat
+
+
+def upsert_known_user(state: dict, chat_id: int, user) -> None:
+    if user is None:
+        return
+    chat = ensure_chat_state(state, chat_id)
+    known = chat.setdefault("known_users", {})
+    known[str(user.id)] = {
+        "id": int(user.id),
+        "username": (user.username or ""),
+        "first_name": (user.first_name or "User"),
+        "is_bot": bool(user.is_bot),
+    }
+
+
+def upsert_known_user_meta(state: dict, chat_id: int, meta: dict) -> None:
+    if not meta or meta.get("id") is None:
+        return
+    chat = ensure_chat_state(state, chat_id)
+    known = chat.setdefault("known_users", {})
+    known[str(int(meta["id"]))] = {
+        "id": int(meta["id"]),
+        "username": (meta.get("username") or ""),
+        "first_name": (meta.get("first_name") or "User"),
+        "is_bot": bool(meta.get("is_bot", False)),
+    }
+
+
+def chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def user_ping(meta: dict) -> tuple[str, bool]:
+    username = (meta.get("username") or "").strip()
+    if username:
+        return (f"@{username.lstrip('@')}", False)
+    user_id = int(meta.get("id", 0))
+    first_name = html.escape((meta.get("first_name") or "du"))
+    return (f'<a href="tg://user?id={user_id}">{first_name}</a>', True)
+
+
+async def remember_chat_user(
+    application: Application,
+    chat_id: int,
+    user,
+) -> None:
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        upsert_known_user(state, chat_id, user)
+        save_reminder_state(state)
+
+
+async def register_poll_reminder(
+    application: Application,
+    chat_id: int,
+    message_id: int,
+    poll_id: str,
+    initiator: Optional[dict],
+    series_id: str,
+) -> None:
+    lock = get_reminder_lock(application)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    async with lock:
+        state = load_reminder_state()
+        polls = state.setdefault("polls", {})
+        chat = ensure_chat_state(state, chat_id)
+        if initiator is not None:
+            upsert_known_user_meta(state, chat_id, initiator)
+        polls[poll_id] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "initiator_id": int(initiator["id"]) if initiator and initiator.get("id") is not None else None,
+            "series_id": series_id,
+            "enabled": True,
+            "created_at": now_ts,
+            "next_reminder_at": now_ts + REMINDER_INTERVAL_SECONDS,
+            "voters": [],
+        }
+        chat.setdefault("known_users", {})
+        chat.setdefault("chilled_users", [])
+        save_reminder_state(state)
+
+
+async def update_poll_vote(application: Application, poll_id: str, user, has_vote: bool) -> None:
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        poll = state.get("polls", {}).get(poll_id)
+        if poll is None:
+            return
+
+        chat_id = int(poll.get("chat_id"))
+        upsert_known_user(state, chat_id, user)
+
+        voters = set(int(item) for item in poll.get("voters", []))
+        if has_vote:
+            voters.add(int(user.id))
+        else:
+            voters.discard(int(user.id))
+        poll["voters"] = sorted(voters)
+        save_reminder_state(state)
+
+
+async def set_user_chilled(application: Application, chat_id: int, user) -> None:
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        upsert_known_user(state, chat_id, user)
+        chat = ensure_chat_state(state, chat_id)
+        chilled = set(int(item) for item in chat.get("chilled_users", []))
+        chilled.add(int(user.id))
+        chat["chilled_users"] = sorted(chilled)
+        save_reminder_state(state)
+
+
+async def disable_poll_reminders(
+    application: Application,
+    chat_id: int,
+    requester_id: int,
+    replied_poll_id: Optional[str],
+) -> tuple[bool, str]:
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        polls = state.setdefault("polls", {})
+        target = None
+
+        if replied_poll_id:
+            target = polls.get(replied_poll_id)
+            if target is None or int(target.get("chat_id", 0)) != int(chat_id):
+                return (False, "Poll nöd gfunde. Bitte uf de Poll antworte.")
+        else:
+            candidates = [
+                poll
+                for poll in polls.values()
+                if int(poll.get("chat_id", 0)) == int(chat_id)
+                and bool(poll.get("enabled", True))
+                and int(poll.get("initiator_id", 0) or 0) == int(requester_id)
+            ]
+            if not candidates:
+                return (False, "I ha kei aktivi Umfrag vo dir gfunde.")
+            if len(candidates) > 1:
+                return (False, "Bitte uf d Umfrag antworte und /nostress schicke.")
+            target = candidates[0]
+
+        if int(target.get("initiator_id", 0) or 0) != int(requester_id):
+            return (False, "Nur dr Initiant cha /nostress für die Umfrag mache.")
+
+        series_id = target.get("series_id")
+        changed = 0
+        for poll in polls.values():
+            if int(poll.get("chat_id", 0)) != int(chat_id):
+                continue
+            same_series = series_id and poll.get("series_id") == series_id
+            if same_series or (replied_poll_id and poll is target) or (not series_id and poll is target):
+                if bool(poll.get("enabled", True)):
+                    poll["enabled"] = False
+                    changed += 1
+
+        save_reminder_state(state)
+        if changed:
+            return (True, "Alles guet, kei Reminder meh für die Umfrag.")
+        return (True, "Die Umfrag isch scho uf nöd-stresse.")
+
+
+async def claim_due_poll_ids(application: Application) -> list[str]:
+    lock = get_reminder_lock(application)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    async with lock:
+        state = load_reminder_state()
+        polls = state.setdefault("polls", {})
+        due: list[str] = []
+        changed = False
+        for poll_id, poll in polls.items():
+            if not bool(poll.get("enabled", True)):
+                continue
+            next_ts = int(poll.get("next_reminder_at", 0) or 0)
+            if next_ts and next_ts <= now_ts:
+                due.append(poll_id)
+                while next_ts <= now_ts:
+                    next_ts += REMINDER_INTERVAL_SECONDS
+                poll["next_reminder_at"] = next_ts
+                changed = True
+
+        if changed:
+            save_reminder_state(state)
+        return due
+
+
+async def build_reminder_payload(application: Application, poll_id: str) -> Optional[dict]:
+    lock = get_reminder_lock(application)
+    async with lock:
+        state = load_reminder_state()
+        poll = state.get("polls", {}).get(poll_id)
+        if poll is None or not bool(poll.get("enabled", True)):
+            return None
+
+        chat_id = int(poll.get("chat_id", 0))
+        chat = ensure_chat_state(state, chat_id)
+        known = chat.get("known_users", {})
+        chilled = set(int(item) for item in chat.get("chilled_users", []))
+        voters = set(int(item) for item in poll.get("voters", []))
+
+        targets = []
+        for user_id, meta in known.items():
+            uid = int(user_id)
+            if meta.get("is_bot"):
+                continue
+            if uid in chilled or uid in voters:
+                continue
+            targets.append(meta)
+
+        return {
+            "chat_id": chat_id,
+            "message_id": int(poll.get("message_id", 0)),
+            "targets": targets,
+        }
+
+
+async def send_reminder_for_poll(application: Application, poll_id: str) -> None:
+    payload = await build_reminder_payload(application, poll_id)
+    if payload is None:
+        return
+
+    pings: list[str] = []
+    needs_html = False
+    for meta in payload["targets"]:
+        mention, is_html = user_ping(meta)
+        pings.append(mention)
+        needs_html = needs_html or is_html
+
+    if not pings:
+        return
+
+    for part in chunked(pings, REMINDER_MENTION_CHUNK_SIZE):
+        text = "chasch no? " + " ".join(part)
+        await application.bot.send_message(
+            chat_id=payload["chat_id"],
+            text=text,
+            reply_to_message_id=payload["message_id"],
+            allow_sending_without_reply=True,
+            parse_mode="HTML" if needs_html else None,
+        )
+
+
+async def reminder_loop(application: Application) -> None:
+    while True:
+        try:
+            for poll_id in await claim_due_poll_ids(application):
+                await send_reminder_for_poll(application, poll_id)
+        except Exception:
+            logging.exception("Reminder loop failed.")
+        await asyncio.sleep(REMINDER_LOOP_SLEEP_SECONDS)
+
+
+async def post_init(application: Application) -> None:
+    get_reminder_lock(application)
+    if application.bot_data.get("reminder_task") is None:
+        application.bot_data["reminder_task"] = asyncio.create_task(reminder_loop(application))
+
+
+async def post_shutdown(application: Application) -> None:
+    task = application.bot_data.get("reminder_task")
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 def clear_poll_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("poll_start", None)
     context.user_data.pop("poll_end", None)
     context.user_data.pop("view_month_start", None)
     context.user_data.pop("view_month_end", None)
+    context.user_data.pop("poll_initiator", None)
     context.user_data.pop("cleanup_message_ids", None)
     context.user_data.pop("poll_timeout_token", None)
 
@@ -397,6 +729,8 @@ async def send_poll_from_state(
         for i in range(0, len(options), MAX_POLL_OPTIONS)
     ]
     total = len(chunks)
+    initiator = context.user_data.get("poll_initiator")
+    series_id = os.urandom(8).hex()
     poll_message_ids: set[int] = set()
     for idx, chunk in enumerate(chunks, start=1):
         part = None if total == 1 else f"({idx}/{total})"
@@ -409,6 +743,15 @@ async def send_poll_from_state(
             allows_multiple_answers=True,
         )
         poll_message_ids.add(poll_message.message_id)
+        if poll_message.poll is not None:
+            await register_poll_reminder(
+                context.application,
+                chat_id=poll_message.chat_id,
+                message_id=poll_message.message_id,
+                poll_id=poll_message.poll.id,
+                initiator=initiator,
+                series_id=series_id,
+            )
 
     try:
         record_poll_stats(message.chat)
@@ -463,6 +806,14 @@ async def begin_poll_picker(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     clear_poll_state(context)
     track_for_cleanup(context, message)
     arm_poll_timeout(context, message.chat_id)
+    user = update.effective_user
+    if user is not None:
+        context.user_data["poll_initiator"] = {
+            "id": int(user.id),
+            "username": user.username or "",
+            "first_name": user.first_name or "User",
+            "is_bot": bool(user.is_bot),
+        }
 
     today = date.today()
     view_month = date(today.year, today.month, 1)
@@ -644,6 +995,14 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message is None:
         return
 
+    user = update.effective_user
+    if user is not None:
+        context.user_data["poll_initiator"] = {
+            "id": int(user.id),
+            "username": user.username or "",
+            "first_name": user.first_name or "User",
+            "is_bot": bool(user.is_bot),
+        }
     track_for_cleanup(context, update.message)
     if len(context.args) < 2:
         await start_command(update, context)
@@ -688,6 +1047,60 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def chillmau_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    await set_user_chilled(context.application, message.chat_id, user)
+    await reply_text_tracked(message, context, "Alles guet, i ping di nüm.")
+
+
+async def nostress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    replied_poll_id = None
+    if message.reply_to_message is not None and message.reply_to_message.poll is not None:
+        replied_poll_id = message.reply_to_message.poll.id
+
+    ok, response = await disable_poll_reminders(
+        context.application,
+        chat_id=message.chat_id,
+        requester_id=user.id,
+        replied_poll_id=replied_poll_id,
+    )
+    if ok:
+        await reply_text_tracked(message, context, response)
+        return
+    await reply_text_tracked(message, context, response)
+
+
+async def remember_seen_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or user is None:
+        return
+    if chat.type not in ("group", "supergroup"):
+        return
+    await remember_chat_user(context.application, chat.id, user)
+
+
+async def poll_answer_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    answer = update.poll_answer
+    if answer is None:
+        return
+    await update_poll_vote(
+        context.application,
+        poll_id=answer.poll_id,
+        user=answer.user,
+        has_vote=bool(answer.option_ids),
+    )
+
+
 async def del_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
@@ -720,7 +1133,13 @@ def main() -> None:
             "Set TELEGRAM_BOT_TOKEN (env var oder .env) bevor du dr Bot startisch."
         )
 
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     picker = ConversationHandler(
         entry_points=[
@@ -748,11 +1167,15 @@ def main() -> None:
         allow_reentry=True,
     )
 
+    app.add_handler(MessageHandler(filters.ALL, remember_seen_user_handler), group=-1)
+    app.add_handler(PollAnswerHandler(poll_answer_update_handler))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("hilf", start_command))
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(CommandHandler("poll", poll_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("chillmau", chillmau_command))
+    app.add_handler(CommandHandler("nostress", nostress_command))
     app.add_handler(CommandHandler("del", del_command))
     app.add_handler(MessageHandler(filters.Regex(r"^/(wäg|waeg)(?:@[A-Za-z0-9_]+)?$"), del_command))
     app.add_handler(picker)
