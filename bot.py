@@ -23,7 +23,7 @@ from telegram.ext import (
 
 MAX_POLL_OPTIONS = 10
 POLL_QUESTION = "chasch no?"
-CREATE_POLL_BUTTON = "Umfrag machä"
+CREATE_POLL_BUTTON = "/umfrag"
 NOOP = "x"
 DEFAULT_STATS_PATH = "data/stats.json"
 DEFAULT_REMINDER_PATH = "data/reminders.json"
@@ -35,7 +35,7 @@ REMINDER_MENTION_CHUNK_SIZE = 8
 INTRO_TEXT = (
     "Hoii i machä poll\n\n"
     "1. /start startet mi\n"
-    "2. „Umfrag machä\"\n"
+    "2. /umfrag\n"
     "3. /cancel zum abbreche\n"
     "4. /wäg uf mini nachricht antworte zum sä lösche\n"
     "5. /hilf zeigt das menu\n"
@@ -1059,7 +1059,7 @@ async def end_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     data = query.data
     start_iso = context.user_data.get("poll_start")
     if not start_iso:
-        await query.edit_message_text("Starttag fehlt. Bitte nomal uf 'Umfrag machä'.")
+        await query.edit_message_text("Starttag fehlt. Bitte nomal /umfrag.")
         return ConversationHandler.END
 
     start_day = date.fromisoformat(start_iso)
@@ -1458,7 +1458,8 @@ def main() -> None:
     picker = ConversationHandler(
         entry_points=[
             CommandHandler("newpoll", begin_poll_picker),
-            MessageHandler(filters.Regex(r"^Umfrag machä$"), begin_poll_picker),
+            CommandHandler("umfrag", begin_poll_picker),
+            MessageHandler(filters.Regex(r"^/umfrag(?:@[A-Za-z0-9_]+)?$"), begin_poll_picker),
         ],
         states={
             PICK_START: [
