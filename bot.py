@@ -44,6 +44,13 @@ INTRO_TEXT = (
 )
 
 PICK_START, PICK_END, PICK_TIME_OPTION, WAIT_TIME_TEXT = range(4)
+DM_PICK_TARGETS = 10
+
+DM_CB_TOGGLE_PREFIX = "dmt:"
+DM_CB_ALL = "dma"
+DM_CB_NONE = "dmn"
+DM_CB_SEND = "dms"
+DM_CB_CANCEL = "dmc"
 
 WEEKDAY_HEADER = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 MONTH_NAMES = [
@@ -250,6 +257,72 @@ def upsert_known_user_meta(state: dict, chat_id: int, meta: dict) -> None:
 
 def chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def clear_dm_pick_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("dm_poll_id", None)
+    context.user_data.pop("dm_target_chat_id", None)
+    context.user_data.pop("dm_target_message_id", None)
+    context.user_data.pop("dm_targets", None)
+    context.user_data.pop("dm_selected_ids", None)
+
+
+def dm_targets_as_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, dict]:
+    raw = context.user_data.get("dm_targets") or []
+    mapping: dict[int, dict] = {}
+    for meta in raw:
+        if not isinstance(meta, dict):
+            continue
+        uid = meta.get("id")
+        if uid is None:
+            continue
+        mapping[int(uid)] = meta
+    return mapping
+
+
+def dm_selector_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    target_map = dm_targets_as_map(context)
+    selected = set(int(item) for item in (context.user_data.get("dm_selected_ids") or []))
+    return (
+        "Wähl, wer i söll pinge.\n"
+        f"{len(selected)} / {len(target_map)} usgwählt."
+    )
+
+
+def dm_selector_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    target_map = dm_targets_as_map(context)
+    selected = set(int(item) for item in (context.user_data.get("dm_selected_ids") or []))
+
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.append(
+        [
+            InlineKeyboardButton("Alli", callback_data=DM_CB_ALL),
+            InlineKeyboardButton("Niemand", callback_data=DM_CB_NONE),
+        ]
+    )
+
+    items = sorted(
+        target_map.items(),
+        key=lambda item: ((item[1].get("first_name") or "").lower(), int(item[0])),
+    )
+    for uid, meta in items:
+        username = (meta.get("username") or "").strip()
+        if username:
+            label = f"@{username.lstrip('@')}"
+        else:
+            label = (meta.get("first_name") or f"user-{uid}").strip()
+        prefix = "✅ " if uid in selected else ""
+        rows.append(
+            [InlineKeyboardButton(f"{prefix}{label[:48]}", callback_data=f"{DM_CB_TOGGLE_PREFIX}{uid}")]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton("Sände", callback_data=DM_CB_SEND),
+            InlineKeyboardButton("Abbräche", callback_data=DM_CB_CANCEL),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def user_ping(meta: dict) -> tuple[str, bool]:
@@ -461,6 +534,33 @@ async def send_reminder_for_poll(application: Application, poll_id: str) -> None
             chat_id=payload["chat_id"],
             text=text,
             reply_to_message_id=payload["message_id"],
+            allow_sending_without_reply=True,
+            parse_mode="HTML" if needs_html else None,
+        )
+
+
+async def send_manual_reminder(
+    application: Application,
+    chat_id: int,
+    message_id: int,
+    targets: list[dict],
+) -> None:
+    pings: list[str] = []
+    needs_html = False
+    for meta in targets:
+        mention, is_html = user_ping(meta)
+        pings.append(mention)
+        needs_html = needs_html or is_html
+
+    if not pings:
+        return
+
+    for part in chunked(pings, REMINDER_MENTION_CHUNK_SIZE):
+        text = "chasch no? " + " ".join(part)
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=message_id,
             allow_sending_without_reply=True,
             parse_mode="HTML" if needs_html else None,
         )
@@ -1101,6 +1201,104 @@ async def poll_answer_update_handler(update: Update, context: ContextTypes.DEFAU
     )
 
 
+async def dm_forwarded_poll_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    message = update.message
+    if message is None or message.poll is None:
+        return ConversationHandler.END
+
+    payload = await build_reminder_payload(context.application, message.poll.id)
+    if payload is None:
+        await reply_text_tracked(message, context, "I kenne die Umfrag nöd oder sie isch uf nöd-stress.")
+        return ConversationHandler.END
+
+    targets = payload.get("targets", [])
+    if not targets:
+        await reply_text_tracked(message, context, "Kei offeni Lüt meh zum pinge.")
+        return ConversationHandler.END
+
+    clear_dm_pick_state(context)
+    context.user_data["dm_poll_id"] = message.poll.id
+    context.user_data["dm_target_chat_id"] = int(payload["chat_id"])
+    context.user_data["dm_target_message_id"] = int(payload["message_id"])
+    context.user_data["dm_targets"] = targets
+    context.user_data["dm_selected_ids"] = [int(meta["id"]) for meta in targets if meta.get("id") is not None]
+
+    await reply_text_tracked(
+        message,
+        context,
+        dm_selector_text(context),
+        reply_markup=dm_selector_keyboard(context),
+    )
+    return DM_PICK_TARGETS
+
+
+async def dm_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return ConversationHandler.END
+
+    await query.answer()
+    data = query.data
+
+    if not context.user_data.get("dm_poll_id"):
+        await query.edit_message_text("Sessi abgloffe. Leit d Umfrag nomal wiiter.")
+        return ConversationHandler.END
+
+    target_map = dm_targets_as_map(context)
+    selected = set(int(item) for item in (context.user_data.get("dm_selected_ids") or []))
+
+    if data == DM_CB_CANCEL:
+        clear_dm_pick_state(context)
+        await query.edit_message_text("Abbroche.")
+        return ConversationHandler.END
+
+    if data == DM_CB_ALL:
+        selected = set(target_map.keys())
+    elif data == DM_CB_NONE:
+        selected = set()
+    elif data == DM_CB_SEND:
+        if not selected:
+            await query.answer("Bitte mind. ei Person uswahlä.", show_alert=True)
+            return DM_PICK_TARGETS
+
+        chat_id = int(context.user_data.get("dm_target_chat_id"))
+        message_id = int(context.user_data.get("dm_target_message_id"))
+        targets = [meta for uid, meta in target_map.items() if uid in selected]
+        try:
+            await send_manual_reminder(context.application, chat_id, message_id, targets)
+        except Exception:
+            await query.edit_message_text("Sände nöd klappt. Prüef mini Gruppe-Recht.")
+            clear_dm_pick_state(context)
+            return ConversationHandler.END
+
+        await query.edit_message_text("Gmacht.")
+        clear_dm_pick_state(context)
+        return ConversationHandler.END
+    elif data.startswith(DM_CB_TOGGLE_PREFIX):
+        with contextlib.suppress(ValueError):
+            uid = int(data.split(":", 1)[1])
+            if uid in selected:
+                selected.remove(uid)
+            elif uid in target_map:
+                selected.add(uid)
+    else:
+        return DM_PICK_TARGETS
+
+    context.user_data["dm_selected_ids"] = sorted(selected)
+    await query.edit_message_text(
+        dm_selector_text(context),
+        reply_markup=dm_selector_keyboard(context),
+    )
+    return DM_PICK_TARGETS
+
+
+async def dm_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    clear_dm_pick_state(context)
+    if update.effective_message:
+        await reply_text_tracked(update.effective_message, context, "Abbroche.")
+    return ConversationHandler.END
+
+
 async def del_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
@@ -1167,6 +1365,20 @@ def main() -> None:
         allow_reentry=True,
     )
 
+    dm_picker = ConversationHandler(
+        entry_points=[MessageHandler(filters.ChatType.PRIVATE & filters.POLL, dm_forwarded_poll_entry)],
+        states={
+            DM_PICK_TARGETS: [
+                CallbackQueryHandler(
+                    dm_pick_callback,
+                    pattern=rf"^({DM_CB_TOGGLE_PREFIX}\d+|{DM_CB_ALL}|{DM_CB_NONE}|{DM_CB_SEND}|{DM_CB_CANCEL})$",
+                )
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", dm_cancel_command)],
+        allow_reentry=True,
+    )
+
     app.add_handler(MessageHandler(filters.ALL, remember_seen_user_handler), group=-1)
     app.add_handler(PollAnswerHandler(poll_answer_update_handler))
     app.add_handler(CommandHandler("start", start_command))
@@ -1178,6 +1390,7 @@ def main() -> None:
     app.add_handler(CommandHandler("nostress", nostress_command))
     app.add_handler(CommandHandler("del", del_command))
     app.add_handler(MessageHandler(filters.Regex(r"^/(wäg|waeg)(?:@[A-Za-z0-9_]+)?$"), del_command))
+    app.add_handler(dm_picker)
     app.add_handler(picker)
 
     app.run_polling()
