@@ -286,11 +286,9 @@ def dm_targets_as_map(context: ContextTypes.DEFAULT_TYPE) -> dict[int, dict]:
 def dm_selector_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     target_map = dm_targets_as_map(context)
     selected = set(int(item) for item in (context.user_data.get("dm_selected_ids") or []))
-    manual = context.user_data.get("dm_manual_handles") or []
     return (
-        "Wähl, wer i söll pinge.\n"
-        f"{len(selected)} / {len(target_map)} usgwählt.\n"
-        f"Manuell: {len(manual)}"
+        "Wän sötti stresse?\n"
+        f"{len(selected)} / {len(target_map)} usgwählt."
     )
 
 
@@ -303,7 +301,7 @@ def dm_selector_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMa
         rows.append(
             [
                 InlineKeyboardButton("Alli", callback_data=DM_CB_ALL),
-                InlineKeyboardButton("Niemand", callback_data=DM_CB_NONE),
+                InlineKeyboardButton("Niemer", callback_data=DM_CB_NONE),
             ]
         )
 
@@ -1238,7 +1236,7 @@ async def chillmau_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     await set_user_chilled(context.application, message.chat_id, user)
-    await reply_text_tracked(message, context, "Alles guet, i ping di nüm.")
+    await reply_text_tracked(message, context, "okok")
 
 
 async def nostress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
