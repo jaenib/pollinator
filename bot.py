@@ -509,9 +509,20 @@ async def mute_user_for_poll(
             return (False, "I finde die Umfrag nöd. Bitte uf en Reminder vo mer antworte.")
 
         upsert_known_user(state, chat_id, user)
-        muted = set(int(item) for item in poll.get("muted_user_ids", []))
-        muted.add(int(user.id))
-        poll["muted_user_ids"] = sorted(muted)
+
+        # Mute across every poll in the same series so the user
+        # does not have to /chillmau each part of a multi-message poll.
+        series_id = poll.get("series_id")
+        targets = [poll]
+        if series_id:
+            for other in polls.values():
+                if other is not poll and other.get("series_id") == series_id:
+                    targets.append(other)
+        for p in targets:
+            muted = set(int(item) for item in p.get("muted_user_ids", []))
+            muted.add(int(user.id))
+            p["muted_user_ids"] = sorted(muted)
+
         save_reminder_state(state)
         return (True, "okok")
 
@@ -553,17 +564,25 @@ async def claim_due_poll_ids(application: Application) -> list[str]:
         state = load_reminder_state()
         polls = state.setdefault("polls", {})
         due: list[str] = []
+        claimed_series: set[str] = set()
         changed = False
         for poll_id, poll in polls.items():
             if not bool(poll.get("enabled", True)):
                 continue
             next_ts = int(poll.get("next_reminder_at", 0) or 0)
             if next_ts and next_ts <= now_ts:
-                due.append(poll_id)
                 while next_ts <= now_ts:
                     next_ts += REMINDER_INTERVAL_SECONDS
                 poll["next_reminder_at"] = next_ts
                 changed = True
+                # Only claim one poll per series so users are not
+                # pinged once per poll message in multi-message polls.
+                sid = poll.get("series_id")
+                if sid and sid in claimed_series:
+                    continue
+                if sid:
+                    claimed_series.add(sid)
+                due.append(poll_id)
 
         if changed:
             save_reminder_state(state)
@@ -582,17 +601,18 @@ async def build_reminder_payload(application: Application, poll_id: str) -> Opti
         chat = ensure_chat_state(state, chat_id)
         known = chat.get("known_users", {})
 
-        # Aggregate voters across all polls in the same series so that
-        # users who participated in *any* part of a multi-message poll
-        # are not nagged about the parts they skipped.
+        # Aggregate voters and mutes across all polls in the same series
+        # so that users who participated in *any* part of a multi-message
+        # poll are not nagged about the parts they skipped, and a single
+        # /chillmau is honoured across the whole series.
         voters = set(int(item) for item in poll.get("voters", []))
+        muted = set(int(item) for item in poll.get("muted_user_ids", []))
         series_id = poll.get("series_id")
         if series_id:
             for other in state.get("polls", {}).values():
                 if other.get("series_id") == series_id:
                     voters.update(int(v) for v in other.get("voters", []))
-
-        muted = set(int(item) for item in poll.get("muted_user_ids", []))
+                    muted.update(int(v) for v in other.get("muted_user_ids", []))
 
         targets = []
         for user_id, meta in known.items():
