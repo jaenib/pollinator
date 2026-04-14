@@ -581,7 +581,17 @@ async def build_reminder_payload(application: Application, poll_id: str) -> Opti
         chat_id = int(poll.get("chat_id", 0))
         chat = ensure_chat_state(state, chat_id)
         known = chat.get("known_users", {})
+
+        # Aggregate voters across all polls in the same series so that
+        # users who participated in *any* part of a multi-message poll
+        # are not nagged about the parts they skipped.
         voters = set(int(item) for item in poll.get("voters", []))
+        series_id = poll.get("series_id")
+        if series_id:
+            for other in state.get("polls", {}).values():
+                if other.get("series_id") == series_id:
+                    voters.update(int(v) for v in other.get("voters", []))
+
         muted = set(int(item) for item in poll.get("muted_user_ids", []))
 
         targets = []
